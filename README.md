@@ -10,13 +10,18 @@ Q·K·V, 마스킹, Softmax, 가중합을 직접 계산하는 **decoder-only 언
 | --- | --- |
 | model.py | 직접 구현한 인과적 멀티 헤드 어텐션, 블록, 모델, 생성 루프 |
 | run.py | 학습, 검증, 체크포인트 저장/불러오기, 생성, 동작 확인 CLI |
+| lora.py | 직접 구현한 LoRA: LoRALinear, 모델에 붙이기, A·B만 저장하기, 병합 |
 | make_corpus.py | 360개의 실습용 문장 생성 |
+| make_finetune_corpus.py | LoRA 파인튜닝용 문장 90개 생성 |
+| finetune.txt | LoRA 파인튜닝에 사용한 UTF-8 데이터 |
 | corpus.txt | 실제 학습에 사용한 UTF-8 데이터 |
 | requirements.txt | 필요한 패키지 |
 | artifacts/model.pt | 실제 학습으로 만든 체크포인트. 검증 loss가 가장 낮았던 평가 시점 |
 | artifacts/metrics.json | 실제 실행 환경, 파라미터 수, loss, 시간, 학습 전후 결과 |
 | artifacts/samples.txt | 학습 전후 문장 생성 결과 |
 | artifacts/train.txt, validation.txt | 실제 분리된 학습/검증 문장 |
+| artifacts/lora/lora.pt | LoRA 어댑터. A·B 행렬과 설정값만 저장 (약 15KB) |
+| artifacts/lora/metrics.json, samples.txt | LoRA 파인튜닝의 loss 기록과 전후 생성 결과 |
 | RUN_RESULT.md | 제공된 체크포인트의 실행 결과 요약 |
 
 ## 2. 설치
@@ -162,11 +167,100 @@ python run.py train --data my-text.txt --out custom-run --prompt "학습 데이�
 python run.py generate --checkpoint custom-run/model.pt --prompt "학습 데이터에 있는 문장"
 ```
 
-사용자 데이터에 맞게 prompt를 바꾸세요. 재학습으로 새 문자 어휘와 새 모델을 만듭니다. 기존 체크포인트에 지식을 덧붙이는 파인튜닝 명령이 아닙니다.
+사용자 데이터에 맞게 prompt를 바꾸세요. 재학습으로 새 문자 어휘와 새 모델을 만듭니다. 기존 체크포인트에 새 패턴을 덧붙이려면 9장의 LoRA 파인튜닝을 사용하세요.
 
-## 9. 확인한 동작과 교육용 생략
+## 9. LoRA로 파인튜닝하기
 
-`python run.py check`는 미래 토큰을 바꿔도 앞 위치의 출력이 변하지 않는지, 출력 텐서 크기, 역전파의 유한한 기울기, 문맥 길이를 넘는 생성을 확인합니다.
+LoRA(Low-Rank Adaptation)는 사전학습된 가중치 W₀를 고정하고, 작은 행렬 두 개 A, B만 학습해 보정값을 더하는 방법입니다.
+
+```text
+W = W₀ + (α/r) · B · A
+
+W₀ : [out, in]   고정
+B  : [out, r]    학습, 0으로 초기화
+A  : [r, in]     학습, 작은 랜덤값으로 초기화
+```
+
+- `r`(rank)은 A, B의 안쪽 차원입니다. 보정값이 가질 수 있는 자유도와 파라미터 수를 정합니다.
+- `α/r`은 LoRA 출력에 곱하는 고정 상수입니다. r을 바꿔도 출력 크기가 비슷하게 유지되도록 합니다.
+- B가 0에서 시작하므로 LoRA를 붙인 직후의 모델은 원래 모델과 출력이 같습니다.
+- 학습이 끝나면 `W₀ + (α/r)·BA`를 하나의 Linear로 병합하므로 추론 비용이 늘지 않습니다.
+
+LLM 전용 기법이 아닙니다. 행렬로 된 가중치를 가진 사전학습 모델이라면 어디에나 붙일 수 있고, `apply_lora`도 모델 종류와 관계없이 이름이 맞는 `nn.Linear`를 찾아 교체합니다.
+
+### 9.1 실행
+
+```bash
+python make_finetune_corpus.py
+python run.py finetune --device cpu
+python run.py generate --device cpu --lora artifacts/lora/lora.pt --prompt "멍개는 "
+
+uv run make_finetune_corpus.py
+uv run run.py finetune --device cpu
+uv run run.py generate --device cpu --lora artifacts/lora/lora.pt --prompt "멍개는 "
+```
+
+`finetune`은 `artifacts/model.pt`를 불러와 고정하고, 어텐션의 `qkv`, `proj` 층에 LoRA를 붙여 `finetune.txt`로 A, B만 학습합니다. 검증 loss가 가장 낮은 시점의 A, B를 `artifacts/lora/lora.pt`에 저장합니다. 베이스 모델 파일은 바뀌지 않습니다.
+
+`generate`에 `--lora`를 주면 어댑터를 베이스 모델에 병합해서 생성하고, 빼면 원래 모델로 생성합니다.
+
+| 옵션 | 기본값 | 의미 |
+| --- | --- | --- |
+| `--base` | artifacts/model.pt | 고정할 사전학습 체크포인트 |
+| `--data` | finetune.txt | 파인튜닝 데이터 |
+| `--out` | artifacts/lora | 어댑터 저장 폴더 |
+| `--targets` | qkv,proj | LoRA를 붙일 Linear 이름. `qkv,proj,0,2`로 주면 FFN에도 붙입니다. |
+| `--rank` | 4 | r |
+| `--alpha` | 8 | α |
+| `--lr` | 0.005 | 사전학습보다 높게 잡습니다. 학습할 값이 적고 B가 0에서 시작하기 때문입니다. |
+| `--steps` | 600 | 학습 단계 수 |
+
+### 9.2 파인튜닝 데이터
+
+사전학습 데이터는 한 줄에 한 문장입니다. 파인튜닝 데이터는 `멍개는`으로 시작하는 줄에 두 문장이 이어지는 새 패턴입니다.
+
+```text
+멍개는 아침에 책을 읽는다. 저녁에 코드를 작성한다.
+```
+
+문자 단위 모델이므로 **베이스 모델의 어휘에 있는 문자만** 사용할 수 있습니다. 파인튜닝할 때는 데이터로 어휘를 새로 만들지 않고 체크포인트의 어휘를 그대로 씁니다. 제공된 `artifacts/model.pt`는 `잠을 잔다.`가 추가되기 전에 학습되어 `잠`, `잔`이 어휘에 없으므로, 이 문장은 파인튜닝 데이터에서 뺐습니다.
+
+### 9.3 실제 실행 결과
+
+| 항목 | 값 |
+| --- | --- |
+| LoRA 적용 층 | qkv, proj × 2블록 (4개 층) |
+| 학습 파라미터 | 3,072 / 114,816 (2.68%) |
+| 어댑터 크기 | 약 15KB |
+| 학습 | 600단계, CPU 6.9초, 300단계 선택 |
+| 새 데이터 검증 loss | 0.6557 → 0.2424 |
+| 원래 데이터 검증 loss | 0.3760 → 0.6492 |
+
+```text
+파인튜닝 전: 멍개는 내일 운동을 한다.
+파인튜닝 후: 멍개는 아침에 책을 읽는다. 저녁에 운동을 한다.
+```
+
+새 패턴은 배웠지만 원래 데이터의 검증 loss가 올라갔습니다. 새 패턴을 배우면서 기존 분포를 잊은 것입니다(catastrophic forgetting). 생성 결과에서도 `학생은 아침에 …. 저녁에 …`처럼 멍개가 아닌 주어에 새 패턴이 번졌습니다. 모델이 작고 파인튜닝 데이터가 한 가지 패턴뿐이라 두드러지며, 원래 데이터를 섞어 학습하면 줄일 수 있습니다.
+
+### 9.4 개념과 코드 연결
+
+| 개념 | 코드 |
+| --- | --- |
+| W₀ 고정 | `p.requires_grad_(False)` |
+| A, B 생성 | `nn.Parameter(torch.empty(r, in))`, `nn.Parameter(torch.zeros(out, r))` |
+| α/r | `self.scaling = alpha / r` |
+| W₀x + (α/r)·BAx | `LoRALinear.forward` |
+| 대상 층 교체 | `apply_lora` |
+| A, B만 최적화 | `AdamW([p for p in model.parameters() if p.requires_grad])` |
+| A, B만 저장 | `lora_state_dict` |
+| W = W₀ + (α/r)·BA 병합 | `LoRALinear.merged`, `merge_lora` |
+
+어댑터는 `LoRALinear` 4개의 A, B 묶음과 설정값(`targets`, `rank`, `alpha`)입니다. 특정 베이스 모델을 기준으로 한 차이값이므로, 베이스 모델을 다시 학습하면 어댑터도 다시 학습해야 합니다. 현재 구현은 한 번에 어댑터 하나만 적용합니다.
+
+## 10. 확인한 동작과 교육용 생략
+
+`python run.py check`는 미래 토큰을 바꿔도 앞 위치의 출력이 변하지 않는지, 출력 텐서 크기, 역전파의 유한한 기울기, 문맥 길이를 넘는 생성을 확인합니다. LoRA에 대해서는 붙인 직후 출력이 원래 모델과 같은지, A·B만 학습되는지, 병합 전후 출력이 같은지 확인합니다.
 
 KV cache, FlashAttention, GQA, MoE, 분산 학습은 넣지 않았습니다. 생성할 때 매번 최근 64문자를 재계산하고 그 창 안에서 위치를 0부터 부여합니다. 긴 문맥을 유지하는 최적화된 LLM 서빙 방식과는 차이가 있습니다. 이 구현에서 어텐션을 직접 수정하며 GQA 등을 실험할 수 있습니다.
 
@@ -175,6 +269,7 @@ CPU 스레드 기본값은 2입니다. 작은 모델은 스레드를 과하게 �
 ## 참고
 
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+- [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
 - [PyTorch CrossEntropyLoss](https://docs.pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html)
 - [PyTorch multinomial](https://docs.pytorch.org/docs/stable/generated/torch.multinomial.html)
 
